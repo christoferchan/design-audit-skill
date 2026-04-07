@@ -357,7 +357,35 @@ grep -r "dark\|darkMode\|colorScheme\|useColorScheme" src/ --include="*.ts" --in
 
 If no dark mode support, note it but don't create it — that's a feature, not an audit fix. Flag it as a recommendation.
 
-**5. Maestro testIDs**
+**5. Framework-specific theme detection**
+Detect the project's styling approach and adapt the audit accordingly:
+
+```bash
+# Tailwind CSS
+ls tailwind.config.* 2>/dev/null && echo "TAILWIND"
+# CSS Modules
+find src/ -name "*.module.css" -o -name "*.module.scss" 2>/dev/null | head -5
+# Styled Components / Emotion
+grep -rn "styled\.\|styled(" src/ --include="*.tsx" --include="*.ts" 2>/dev/null | head -5
+# CSS Variables (custom properties)
+grep -rn ":root\|--[a-z]" src/ --include="*.css" 2>/dev/null | head -10
+# SwiftUI (iOS native)
+find . -name "*.swift" 2>/dev/null | head -3 && grep -rn "Color(" . --include="*.swift" 2>/dev/null | head -5
+# Flutter
+ls pubspec.yaml 2>/dev/null && grep -rn "ThemeData\|ColorScheme" lib/ --include="*.dart" 2>/dev/null | head -5
+```
+
+Adapt the audit based on what's found:
+- **Tailwind**: Check `tailwind.config.js` for custom theme values vs defaults. Flag screens using default Tailwind colors (blue-500, gray-200) instead of custom theme tokens. Check for arbitrary values (`text-[#ff0000]`) that bypass the config.
+- **CSS Modules**: Scan `.module.css` files for hardcoded color/spacing values instead of CSS variable references.
+- **Styled Components**: Check if `styled.` usages reference a theme provider (`${props => props.theme.X}`) vs hardcoded values.
+- **CSS Variables**: Scan `:root` block in `globals.css` for the variable definitions. Check components reference `var(--token)` vs hardcoded values.
+- **SwiftUI**: Scan for `Color(` with hex literals vs named colors from an asset catalog or extension.
+- **Flutter**: Scan for `ThemeData` usage and check if widgets reference `Theme.of(context)` vs hardcoded `Color(0xFF...)`.
+
+If none of these are detected, fall back to the React Native `theme.ts` approach.
+
+**6. Maestro testIDs**
 Check if components have testIDs for automation:
 ```bash
 grep -r "testID" src/ app/ --include="*.tsx" | wc -l
@@ -625,6 +653,47 @@ mv *.png maestro/screenshots/full-app/
   - App not loading: Metro needs restart (`npx expo start --clear`)
   - Keyboard blocking elements: use swipe gestures to dismiss
 
+### Screenshot Naming Convention
+
+Enforce a consistent naming convention across all capture runs so before/after comparisons work across sessions:
+
+**Format:** `[NNN]-[screen]-[state].png`
+
+**Rules:**
+- `NNN` = zero-padded 3-digit sequence number (e.g., `001`, `042`, `107`)
+- `screen` = kebab-case screen name matching the route (e.g., `home`, `spot-detail`, `trip-wizard-step3`)
+- `state` = optional suffix describing the UI state being captured
+
+**State suffixes (standardized):**
+- `-top` — screen at scroll position 0
+- `-scroll` — screen after scrolling down
+- `-bottom` — screen scrolled to the end
+- `-empty` — empty state (no data)
+- `-error` — error state
+- `-loading` — loading/skeleton state
+- `-hover` — hover state (web only)
+- `-focus` — input focus state
+- `-expanded` — sheet/modal/accordion expanded
+- `-dark` — dark mode variant (prefix with same number as light equivalent)
+
+**Examples:**
+```
+001-home-top.png
+002-home-scroll.png
+003-spot-detail-top.png
+003-spot-detail-scroll.png
+004-trip-wizard-step1.png
+078-dark-home-top.png
+079-dark-spot-detail-top.png
+```
+
+**Why this matters:**
+- Consistent naming lets Phase 5 (before/after) diff the same screen across runs by matching filenames
+- The sequence numbers create a stable ordering so new screens slot in without renumbering
+- State suffixes make it clear what each screenshot represents without opening it
+
+When generating capture flows (Phase 0C), use these naming conventions in the `takeScreenshot` commands. On subsequent runs, reuse the same numbering scheme so filenames stay comparable.
+
 ### Final Screenshot Count
 Report: "X screenshots captured — Y light mode, Z dark mode. N screens not captured: [list]"
 
@@ -639,6 +708,32 @@ Before looking at any screenshot, read these files to understand the rules:
 
 ### Read Every Screenshot
 Use the Read tool on every `.png` file in the screenshots directory. Don't skip any.
+
+### Design Token Coverage Metric
+
+Before evaluating screenshots, calculate the design system adoption rate as a baseline metric:
+
+```bash
+# Count total style-related declarations in components
+TOTAL_STYLES=$(grep -rn "color:\|backgroundColor:\|fontSize:\|fontFamily:\|margin:\|padding:\|borderRadius:\|borderColor:" src/ app/ --include="*.tsx" --include="*.ts" | grep -v "node_modules\|theme\.\|constants/" | wc -l)
+
+# Count hardcoded values (not using theme tokens)
+HARDCODED_COLORS=$(grep -rn "'#[0-9A-Fa-f]\{3,8\}'" src/ app/ --include="*.tsx" | grep -v "theme\|constants\|vibeColors" | wc -l)
+HARDCODED_SPACING=$(grep -rn "margin.*: [0-9]\|padding.*: [0-9]" src/ app/ --include="*.tsx" | grep -v "StyleSheet\|makeStyles\|theme\.\|spacing" | wc -l)
+HARDCODED_FONTS=$(grep -rn "fontFamily.*'" src/ app/ --include="*.tsx" | grep -v "theme\|constants\|typography" | wc -l)
+HARDCODED_TOTAL=$((HARDCODED_COLORS + HARDCODED_SPACING + HARDCODED_FONTS))
+
+# Calculate adoption rate
+ADOPTION=$(( (TOTAL_STYLES - HARDCODED_TOTAL) * 100 / TOTAL_STYLES ))
+echo "Design system adoption: ${ADOPTION}% — ${HARDCODED_TOTAL} hardcoded values out of ${TOTAL_STYLES} total"
+```
+
+Include this metric at the top of every audit report. Track it across runs (Phase 6) to measure whether the codebase is converging on or drifting from the design system.
+
+**Thresholds:**
+- 90%+ = excellent — flag individual hardcoded values for cleanup
+- 70-89% = good — flag as a systemic improvement opportunity
+- Below 70% = poor — recommend a dedicated centralization pass before auditing individual screens
 
 ### Evaluate Each Screen Against This Checklist
 
@@ -667,6 +762,17 @@ Use the Read tool on every `.png` file in the screenshots directory. Don't skip 
 - [ ] Text hierarchy preserved (primary/secondary/tertiary all readable)
 - [ ] Placeholder images/icons visible against dark background
 
+**Cross-Theme Consistency (compare light vs dark):**
+After checking light and dark mode separately, compare them side by side:
+- [ ] Every element visible in light mode has a corresponding dark mode version — nothing disappears
+- [ ] Interactive elements (buttons, links, chips) have both light and dark styles defined — not falling back to invisible defaults
+- [ ] Icons and illustrations that use hardcoded fill colors remain visible in both themes
+- [ ] Shadows that provide separation in light mode have a dark equivalent (border, background shift, or elevated surface)
+- [ ] Charts, graphs, or data visualizations are readable in both themes
+- [ ] Placeholder/empty-state illustrations are adapted for dark backgrounds (not white-background PNGs on dark surfaces)
+
+To check systematically: match light and dark screenshots by screen name (using the naming convention) and compare each pair. Flag any element that appears in one theme but not the other.
+
 **Layout:**
 - [ ] No content clipped by floating elements (FABs, tab bars, keyboards)
 - [ ] No overlapping UI elements (toasts stacking on banners on CTAs)
@@ -681,6 +787,36 @@ Use the Read tool on every `.png` file in the screenshots directory. Don't skip 
 - [ ] Error states are human-readable
 - [ ] Empty states inspire action ("Be the first to...") not state facts ("No data")
 - [ ] Validation errors only show after user attempts submission
+
+**Performance & Assets:**
+- [ ] Images are appropriately sized for the device — not loading 4K originals on a phone. Check for resize parameters in image URLs (Supabase storage `?width=`, Cloudinary transforms, `srcSet` on web).
+  ```bash
+  # Check for image optimization patterns
+  grep -rn "width=\|height=\|resize\|transform\|srcSet\|sizes=" src/ app/ --include="*.tsx" | head -20
+  # Check for image components with loading states
+  grep -rn "placeholder\|blurhash\|progressive\|onLoadStart\|onLoad=" src/ app/ --include="*.tsx" | head -10
+  # Check for image caching
+  grep -rn "cache\|FastImage\|Image.prefetch\|next/image" src/ app/ --include="*.tsx" --include="*.ts" | head -10
+  ```
+- [ ] Images have loading states (blur-up, placeholder, skeleton) — not a blank space that pops in
+- [ ] Image caching is implemented (react-native-fast-image, next/image, or equivalent)
+- [ ] Placeholder/fallback images display correctly when the source fails to load
+
+**Typography Consistency:**
+Scan for all font sizes and families used across the app and compare against the defined typography ramp:
+```bash
+# Find all fontSize values in components
+grep -rn "fontSize.*:" src/ app/ --include="*.tsx" | grep -v "node_modules\|theme\.\|constants/" | sed 's/.*fontSize[:\s]*//' | sort | uniq -c | sort -rn
+# Find all fontFamily values in components
+grep -rn "fontFamily.*:" src/ app/ --include="*.tsx" | grep -v "node_modules\|theme\.\|constants/" | head -20
+# Find all Text style presets from theme
+grep -rn "typography\.\|textStyle\.\|font\." src/constants/theme.ts | head -20
+```
+- [ ] Every font size used in the app maps to a defined text style in the theme (e.g., `typography.body`, `typography.h2`)
+- [ ] No raw `fontSize: 13` or `fontSize: 17` that doesn't match a ramp value — flag each orphan size
+- [ ] No direct `fontFamily: 'Plus Jakarta Sans'` that bypasses the theme's typography tokens — should use `typography.fontFamily.sans` or equivalent
+- [ ] Display font (Fraunces/serif) only used for editorial moments (h1, h2, hero text), not body/UI text
+- [ ] Line heights are proportional and consistent (not mixing `lineHeight: 1.2` and `lineHeight: 24` arbitrarily)
 
 **Visual Quality:**
 - [ ] No duplicate actions (same button appearing twice on one screen)
@@ -861,6 +997,91 @@ Generate a checklist for things screenshots can't capture:
 - [ ] Navigation transitions — push/pop feel native
 - [ ] Dark mode toggle — instant switch, no flash of wrong theme
 
+### Multi-Language / RTL Support
+
+Detect whether the app has internationalization support:
+```bash
+# Check for i18n libraries and patterns
+grep -rn "i18n\|intl\|locale\|t('\|t(\")\|useTranslation\|FormatMessage\|defineMessages\|react-intl\|i18next\|expo-localization" src/ app/ --include="*.ts" --include="*.tsx" | head -20
+# Check for RTL-specific handling
+grep -rn "RTL\|rtl\|isRTL\|I18nManager\|direction.*rtl\|writingDirection" src/ app/ --include="*.ts" --include="*.tsx" | head -10
+# Check for locale-aware formatting
+grep -rn "toLocaleDateString\|toLocaleString\|Intl\.NumberFormat\|Intl\.DateTimeFormat\|formatCurrency\|formatDate" src/ app/ --include="*.ts" --include="*.tsx" | head -10
+```
+
+**If i18n support exists**, generate this checklist:
+- [ ] RTL layout: Do flexbox rows reverse correctly? Check `flexDirection: 'row'` containers — in RTL these should flip.
+- [ ] Icons with directional meaning (arrows, chevrons) flip appropriately in RTL
+- [ ] Translated strings don't overflow their containers — German/Finnish text is often 40% longer than English
+- [ ] Date formats are locale-aware (MM/DD/YYYY vs DD/MM/YYYY vs YYYY-MM-DD)
+- [ ] Currency formatting uses locale conventions (€1.000,00 vs $1,000.00)
+- [ ] Number formatting respects locale (decimal separators, thousands grouping)
+- [ ] Text alignment (`textAlign: 'left'`) uses `'start'`/`'end'` instead for RTL compatibility
+- [ ] Padding/margin that's asymmetric (e.g., `paddingLeft: 16, paddingRight: 8`) uses `paddingStart`/`paddingEnd`
+
+**If no i18n support exists**, flag as a recommendation:
+> "No internationalization detected. If this app will serve non-English markets, consider adding i18n support. Key concerns: RTL layout support, string externalization, locale-aware date/currency formatting."
+
+### State Persistence Across App Restart
+
+Screenshots capture a single session, but users experience the app across restarts. Generate a manual checklist for persistence testing:
+
+- [ ] **Dark mode preference**: Toggle dark mode → kill app → relaunch. Does the theme persist?
+- [ ] **Auth state**: Log in → kill app → relaunch. Is the user still logged in? Or shown a login screen flash?
+- [ ] **Onboarding completion**: Complete onboarding → kill app → relaunch. Does onboarding show again?
+- [ ] **Cached data**: Load the home feed → kill app → enable airplane mode → relaunch. Does cached content appear immediately, or is it a blank/loading screen?
+- [ ] **Form state**: Start filling a multi-step form → kill app → relaunch → navigate back. Is partial input preserved?
+- [ ] **Scroll position**: Scroll deep into a list → switch tabs → return. Is the position retained?
+- [ ] **Tab memory**: Navigate into a sub-screen on Tab 2 → switch to Tab 1 → switch back to Tab 2. Is the sub-screen still showing, or reset to root?
+
+Check what persistence mechanism the app uses:
+```bash
+# AsyncStorage
+grep -rn "AsyncStorage\|MMKV\|SecureStore\|expo-secure-store" src/ --include="*.ts" --include="*.tsx" | head -10
+# Check what's being persisted
+grep -rn "\.set(\|\.setItem(\|\.save(" src/ --include="*.ts" --include="*.tsx" | head -20
+```
+
+Flag any preference or state that is visually impactful (dark mode, auth, onboarding) but not persisted.
+
+### Animation / Motion Audit
+
+Screenshots can't assess animation quality, but code analysis can flag issues. Run these checks:
+
+```bash
+# Count animation usage
+grep -rn "withSpring\|withTiming\|withDecay\|useAnimatedStyle\|useSharedValue" src/ app/ --include="*.tsx" --include="*.ts" | wc -l
+# Framer Motion (web)
+grep -rn "motion\.\|animate=\|variants=\|transition=" src/ web/ --include="*.tsx" --include="*.ts" | wc -l
+# CSS transitions/animations
+grep -rn "transition:\|@keyframes\|animation:" src/ web/ --include="*.css" --include="*.tsx" | wc -l
+```
+
+**Check for consistent spring configs:**
+```bash
+# Extract all spring/timing config values
+grep -rn "withSpring(\|damping:\|stiffness:\|mass:" src/ app/ --include="*.tsx" --include="*.ts" | head -30
+grep -rn "withTiming(\|duration:\|easing:" src/ app/ --include="*.tsx" --include="*.ts" | head -30
+```
+- Flag if there are more than 3 distinct spring configs — the app should use a small set of motion presets (e.g., `springGentle`, `springSnappy`, `springBouncy`)
+- Flag any `withSpring` using the default config — these should be intentional, not accidental defaults
+
+**Check if reduce motion is respected:**
+```bash
+grep -rn "useReducedMotion\|reduceMotion\|prefersReducedMotion\|accessibilityReduceMotion" src/ --include="*.tsx" --include="*.ts" | head -5
+```
+- If animations exist but no reduce motion check: flag as accessibility issue
+- Recommendation: wrap all non-essential animations in a `useReducedMotion()` guard
+
+**Manual motion quality checklist:**
+- [ ] Spring animations don't bounce (per CLAUDE.md: "no bounce animations")
+- [ ] Animations run at 60fps with `useNativeDriver: true` or Reanimated's native thread
+- [ ] Sheet/modal open/close transitions are smooth, not janky
+- [ ] Skeleton shimmer animations are subtle, not distracting
+- [ ] Page transitions feel platform-native (iOS: push/pop slide, Android: material motion)
+- [ ] No animations on initial render that delay content visibility
+- [ ] Long press / hold animations have clear progress indication
+
 ### Platform Conventions (iOS)
 Check against Human Interface Guidelines:
 - [ ] Back swipe gesture works on all push screens
@@ -961,6 +1182,53 @@ grep -rn "'#[0-9A-Fa-f]\{3,8\}'" src/ app/ --include="*.tsx" | grep -v "theme\|c
 # Count hardcoded spacing (anti-pattern)
 grep -rn "margin.*: [0-9]\|padding.*: [0-9]" src/ app/ --include="*.tsx" | grep -v "StyleSheet\|makeStyles\|theme\." | wc -l
 ```
+
+### Component Inventory vs Actual Usage
+
+Check whether shared components are actually being used, or if screens are rolling their own:
+
+```bash
+# List all shared UI components
+SHARED_COMPONENTS=$(ls src/components/ui/*.tsx 2>/dev/null | sed 's/.*\///' | sed 's/\.tsx//')
+
+# For each shared component, count how many files import it
+for comp in $SHARED_COMPONENTS; do
+  COUNT=$(grep -rn "import.*$comp\|from.*$comp" src/ app/ --include="*.tsx" | grep -v "node_modules" | wc -l)
+  echo "$comp: $COUNT usages"
+done
+```
+
+**Then check for component bypass — screens building their own versions instead of using shared ones:**
+
+```bash
+# If a Button component exists, how many screens use raw Pressable/TouchableOpacity for actions?
+SHARED_BUTTON_IMPORTS=$(grep -rn "import.*Button" src/ app/ --include="*.tsx" | grep "components/ui" | wc -l)
+RAW_PRESSABLE=$(grep -rn "<Pressable\|<TouchableOpacity" src/ app/ --include="*.tsx" | grep -v "components/ui\|node_modules" | wc -l)
+echo "Shared Button used: $SHARED_BUTTON_IMPORTS times. Raw Pressable/TouchableOpacity: $RAW_PRESSABLE times."
+
+# If an Input component exists, how many screens use raw TextInput?
+SHARED_INPUT_IMPORTS=$(grep -rn "import.*Input" src/ app/ --include="*.tsx" | grep "components/ui" | wc -l)
+RAW_TEXTINPUT=$(grep -rn "<TextInput" src/ app/ --include="*.tsx" | grep -v "components/ui\|node_modules" | wc -l)
+echo "Shared Input used: $SHARED_INPUT_IMPORTS times. Raw TextInput: $RAW_TEXTINPUT times."
+
+# If a Card component exists, how many screens create custom card Views?
+# (this one is harder to detect — look for View with border/radius/shadow patterns)
+grep -rn "borderRadius.*12\|borderWidth.*1\|shadowColor" src/ app/ --include="*.tsx" | grep -v "components/ui\|makeStyles\|theme" | wc -l
+```
+
+**Output a usage table:**
+```
+Component       | Shared Usage | Bypass Usage | Adoption Rate
+----------------|-------------|--------------|---------------
+Button          | 47          | 12           | 80%
+Input           | 18          | 3            | 86%
+Tag/Chip        | 23          | 8            | 74%
+Card (pattern)  | 31          | 15           | 67%
+NavBackButton   | 22          | 0            | 100%
+```
+
+Flag specific files that bypass shared components — these are the highest-value cleanup targets. Example output:
+> "Button component exists but `app/spot/[id].tsx` and `app/trip/[id].tsx` use custom `<Pressable>` for their primary CTAs instead."
 
 ### Design System Adoption Score
 Calculate a health score:
